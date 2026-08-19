@@ -2,6 +2,7 @@ from pathlib import Path
 
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision import transforms
 
 
 class OpenImagesDataset(Dataset):
@@ -17,11 +18,6 @@ class OpenImagesDataset(Dataset):
         .png
         .bmp
         .webp
-
-    Note:
-        Open Images V6 contains additional metadata and annotations.
-        For the LIC image-compression stage, this prototype loader
-        only needs the training images.
     """
 
     IMAGE_EXTENSIONS = {
@@ -32,9 +28,8 @@ class OpenImagesDataset(Dataset):
         ".webp",
     }
 
-    def __init__(self, root, transform=None):
+    def __init__(self, root, transform=None, crop_size=None):
         self.root = Path(root)
-        self.transform = transform
 
         if not self.root.exists():
             raise FileNotFoundError(
@@ -52,6 +47,16 @@ class OpenImagesDataset(Dataset):
             raise RuntimeError(
                 f"No supported images found in dataset directory: {self.root}"
             )
+
+        if transform is not None:
+            self.transform = transform
+        elif crop_size is not None:
+            self.transform = transforms.Compose([
+                transforms.RandomCrop(crop_size),
+                transforms.ToTensor(),
+            ])
+        else:
+            self.transform = transforms.ToTensor()
 
     def __len__(self):
         return len(self.image_paths)
