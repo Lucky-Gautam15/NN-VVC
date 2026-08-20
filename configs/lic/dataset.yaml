@@ -1,0 +1,10 @@
+dataset:
+  name: openimages
+  root: data/processed/openimages
+  image_size: 256
+  crop: random
+
+loader:
+  batch_size: 1
+  shuffle: true
+  num_workers: 0
