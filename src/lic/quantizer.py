@@ -16,9 +16,12 @@ class StraightThroughQuantizer(nn.Module):
     """
 
     def forward(self, y):
-        y_quantized = torch.round(y)
+        if self.training:
+            y_quantized = torch.round(y)
+            # Straight-through estimator during training:
+            # forward  -> rounded value
+            # backward -> approximately identity
+            return y + (y_quantized - y).detach()
 
-        # Straight-through estimator:
-        # forward  -> rounded value
-        # backward -> approximately identity
-        return y + (y_quantized - y).detach()
+        # Deterministic scalar quantization during evaluation/inference
+        return torch.round(y)
