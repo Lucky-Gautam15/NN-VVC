@@ -5,6 +5,7 @@ from src.datasets.openimages import OpenImagesDataset
 from src.lic.lic_model import LICModel
 from src.losses.rate_loss import GaussianRateLoss
 from src.losses.mse_loss import MSELoss
+from src.losses.proxy_loss import ProxyFeatureExtractor, ProxyFeatureLoss
 from src.losses.lic_loss import LICLoss
 from src.training.train_step import train_step
 
@@ -14,6 +15,7 @@ def train(
     epochs=1,
     batch_size=1,
     learning_rate=2e-4,
+    use_proxy_loss=True,
 ):
     dataset = OpenImagesDataset(
         dataset_root,
@@ -42,6 +44,13 @@ def train(
         w_task=1.0,
     )
 
+    if use_proxy_loss:
+        proxy_extractor = ProxyFeatureExtractor()
+        proxy_loss_fn = ProxyFeatureLoss()
+    else:
+        proxy_extractor = None
+        proxy_loss_fn = None
+
     for epoch in range(epochs):
         for step, x in enumerate(loader):
             losses = train_step(
@@ -51,6 +60,8 @@ def train(
                 rate_loss_fn,
                 mse_loss_fn,
                 lic_loss_fn,
+                proxy_extractor=proxy_extractor,
+                proxy_loss_fn=proxy_loss_fn,
             )
 
             print(
@@ -58,6 +69,7 @@ def train(
                 f"Step {step + 1}/{len(loader)} "
                 f"Rate={losses['rate_loss'].item():.4f} "
                 f"MSE={losses['mse_loss'].item():.4f} "
+                f"Task={losses['task_loss'].item():.4f} "
                 f"Total={losses['total_loss'].item():.4f}"
             )
 

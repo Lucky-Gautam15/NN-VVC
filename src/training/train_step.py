@@ -8,6 +8,8 @@ def train_step(
     rate_loss_fn,
     mse_loss_fn,
     lic_loss_fn,
+    proxy_extractor=None,
+    proxy_loss_fn=None,
 ):
     """
     Run one training step for the prototype LIC model.
@@ -17,15 +19,10 @@ def train_step(
           -> LIC model
           -> rate loss
           -> MSE loss
+          -> proxy task loss (optional)
           -> combined LIC loss
           -> backward
           -> optimizer step
-
-    Note:
-        The task/proxy loss is not included yet because the current
-        proxy feature extractor intentionally runs without gradients.
-        It will be integrated separately after the basic training
-        gradient path is verified.
     """
 
     model.train()
@@ -45,10 +42,13 @@ def train_step(
         output["reconstruction"],
     )
 
-    # Temporary task-loss placeholder.
-    # This will be replaced by the proxy loss once its gradient
-    # integration is handled.
-    task_loss = torch.zeros_like(mse_loss)
+    if proxy_extractor is not None and proxy_loss_fn is not None:
+        with torch.no_grad():
+            target_features = proxy_extractor(x)
+        reconstructed_features = proxy_extractor(output["reconstruction"])
+        task_loss = proxy_loss_fn(target_features, reconstructed_features)
+    else:
+        task_loss = torch.zeros_like(mse_loss)
 
     total_loss = lic_loss_fn(
         rate_loss,

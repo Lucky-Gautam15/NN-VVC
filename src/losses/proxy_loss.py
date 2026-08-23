@@ -35,7 +35,6 @@ class ProxyFeatureExtractor(nn.Module):
         for parameter in self.model.parameters():
             parameter.requires_grad = False
 
-    @torch.no_grad()
     def forward(self, images):
         """
         Args:
