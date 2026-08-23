@@ -11,6 +11,7 @@ from src.losses.proxy_loss import ProxyFeatureExtractor, ProxyFeatureLoss
 from src.losses.lic_loss import LICLoss
 from src.training.train_step import train_step
 from src.training.checkpoint import save_checkpoint, load_checkpoint
+from src.training.lws import LWSScheduler
 
 
 def train(
@@ -22,6 +23,7 @@ def train(
     checkpoint_dir="checkpoints/lic",
     checkpoint_interval=1,
     resume_from=None,
+    use_lws=True,
 ):
     dataset = OpenImagesDataset(
         dataset_root,
@@ -41,6 +43,8 @@ def train(
         model.parameters(),
         lr=learning_rate,
     )
+
+    lws_scheduler = LWSScheduler() if use_lws else None
 
     start_epoch = 0
     total_steps = 0
@@ -70,6 +74,18 @@ def train(
         proxy_loss_fn = None
 
     for epoch in range(start_epoch, epochs):
+        # Update weights from LWS scheduler if enabled
+        if lws_scheduler is not None:
+            w_rate, w_mse, w_task = lws_scheduler.get_weights(epoch)
+            lic_loss_fn.w_rate = w_rate
+            lic_loss_fn.w_mse = w_mse
+            lic_loss_fn.w_task = w_task
+        else:
+            w_rate, w_mse, w_task = lic_loss_fn.w_rate, lic_loss_fn.w_mse, lic_loss_fn.w_task
+
+        target_qp = lws_scheduler.get_target_qp(epoch + 1) if lws_scheduler is not None else None
+        qp_tag = f" [Target QP: {target_qp}]" if target_qp is not None else ""
+
         for step, x in enumerate(loader):
             losses = train_step(
                 model,
@@ -86,6 +102,10 @@ def train(
             loss_entry = {
                 "epoch": epoch + 1,
                 "step": total_steps,
+                "w_rate": w_rate,
+                "w_mse": w_mse,
+                "w_task": w_task,
+                "target_qp": target_qp,
                 "rate_loss": float(losses["rate_loss"]),
                 "mse_loss": float(losses["mse_loss"]),
                 "task_loss": float(losses["task_loss"]),
@@ -94,7 +114,8 @@ def train(
             loss_history.append(loss_entry)
 
             print(
-                f"Epoch {epoch + 1}/{epochs} "
+                f"Epoch {epoch + 1}/{epochs}{qp_tag} "
+                f"w_r={w_rate:.6f} w_m={w_mse:.1f} w_t={w_task:.6f} | "
                 f"Step {step + 1}/{len(loader)} "
                 f"Rate={losses['rate_loss'].item():.4f} "
                 f"MSE={losses['mse_loss'].item():.4f} "
@@ -117,9 +138,33 @@ def train(
                     "batch_size": batch_size,
                     "learning_rate": learning_rate,
                     "use_proxy_loss": use_proxy_loss,
+                    "use_lws": use_lws,
                 },
+                target_qp=target_qp,
             )
             print(f"Checkpoint saved: {ckpt_path}")
+
+            # If this is one of the 6 target QP checkpoints, save a named copy
+            if target_qp is not None:
+                qp_ckpt_path = Path(checkpoint_dir) / f"lic_qp_{target_qp}.pt"
+                save_checkpoint(
+                    filepath=qp_ckpt_path,
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch + 1,
+                    step=total_steps,
+                    loss_history=loss_history,
+                    config={
+                        "dataset_root": str(dataset_root),
+                        "epochs": epochs,
+                        "batch_size": batch_size,
+                        "learning_rate": learning_rate,
+                        "use_proxy_loss": use_proxy_loss,
+                        "use_lws": use_lws,
+                    },
+                    target_qp=target_qp,
+                )
+                print(f"Target QP Checkpoint saved: {qp_ckpt_path}")
 
     return model
 
