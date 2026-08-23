@@ -6,20 +6,24 @@ import torch.nn as nn
 
 class GaussianRateLoss(nn.Module):
     """
-    Estimate the coding rate of quantized latent values.
+    Estimate the coding rate of quantized latent values using a
+    discrete Gaussian likelihood over unit quantization bins.
 
-    The probability model provides:
-        mean
-        scale
+    For each quantized latent element y_hat, the discrete probability
+    mass is the integral of the Gaussian PDF over [y_hat - 0.5, y_hat + 0.5]:
 
-    We model each latent value with a Gaussian distribution and
-    compute an approximate negative log2 probability.
+        P(y_hat) = CDF(y_hat + 0.5) - CDF(y_hat - 0.5)
+                 = 0.5 * [erf((y_hat + 0.5 - mean) / (sqrt(2) * scale))
+                        - erf((y_hat - 0.5 - mean) / (sqrt(2) * scale))]
 
-    This is a differentiable rate proxy for training.
-    It is NOT the final ANS entropy coder.
+    The estimated rate (information content) in bits is:
+        rate = -log2(P(y_hat))
+
+    This is a differentiable discrete rate proxy for neural image
+    compression training.
     """
 
-    def __init__(self, eps=1e-6):
+    def __init__(self, eps=1e-9):
         super().__init__()
         self.eps = eps
 
@@ -27,30 +31,33 @@ class GaussianRateLoss(nn.Module):
         """
         Args:
             y:
-                Quantized latent tensor.
+                Quantized latent tensor (y_hat).
 
             mean:
-                Predicted Gaussian mean.
+                Predicted Gaussian mean tensor.
 
             scale:
-                Predicted positive Gaussian scale.
+                Predicted positive Gaussian scale tensor.
 
         Returns:
             Mean estimated rate in bits per latent element.
         """
+        # Ensure scale is non-negative and bounded away from zero.
+        scale = torch.clamp(scale, min=1e-6)
 
-        scale = torch.clamp(scale, min=self.eps)
+        # Scale factor for erf normalization: 1 / (sqrt(2) * scale)
+        inv_scale_sqrt2 = 1.0 / (math.sqrt(2.0) * scale)
 
-        # Gaussian negative log-likelihood:
-        # 0.5 * log(2*pi) + log(scale)
-        # + (y - mean)^2 / (2*scale^2)
-        nll_nats = (
-            0.5 * math.log(2.0 * math.pi)
-            + torch.log(scale)
-            + (y - mean).pow(2) / (2.0 * scale.pow(2))
-        )
+        upper = (y + 0.5 - mean) * inv_scale_sqrt2
+        lower = (y - 0.5 - mean) * inv_scale_sqrt2
 
-        # Convert natural logarithm to log2.
-        rate_bits = nll_nats / math.log(2.0)
+        # Integral of Gaussian density over [y - 0.5, y + 0.5]
+        likelihood = 0.5 * (torch.erf(upper) - torch.erf(lower))
+
+        # Clamp likelihood to prevent log(0), NaNs, or negative probabilities
+        likelihood = torch.clamp(likelihood, min=self.eps)
+
+        # Rate in bits: -log2(P(y))
+        rate_bits = -torch.log2(likelihood)
 
         return rate_bits.mean()
