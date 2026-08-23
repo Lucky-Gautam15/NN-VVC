@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -8,6 +10,7 @@ from src.losses.mse_loss import MSELoss
 from src.losses.proxy_loss import ProxyFeatureExtractor, ProxyFeatureLoss
 from src.losses.lic_loss import LICLoss
 from src.training.train_step import train_step
+from src.training.checkpoint import save_checkpoint, load_checkpoint
 
 
 def train(
@@ -16,6 +19,9 @@ def train(
     batch_size=1,
     learning_rate=2e-4,
     use_proxy_loss=True,
+    checkpoint_dir="checkpoints/lic",
+    checkpoint_interval=1,
+    resume_from=None,
 ):
     dataset = OpenImagesDataset(
         dataset_root,
@@ -36,6 +42,18 @@ def train(
         lr=learning_rate,
     )
 
+    start_epoch = 0
+    total_steps = 0
+    loss_history = []
+
+    if resume_from is not None:
+        print(f"Resuming from checkpoint: {resume_from}")
+        ckpt = load_checkpoint(resume_from, model=model, optimizer=optimizer)
+        start_epoch = ckpt.get("epoch", 0)
+        total_steps = ckpt.get("step", 0)
+        loss_history = ckpt.get("loss_history", [])
+        print(f"Resumed at Epoch: {start_epoch}, Step: {total_steps}")
+
     rate_loss_fn = GaussianRateLoss()
     mse_loss_fn = MSELoss()
     lic_loss_fn = LICLoss(
@@ -51,7 +69,7 @@ def train(
         proxy_extractor = None
         proxy_loss_fn = None
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         for step, x in enumerate(loader):
             losses = train_step(
                 model,
@@ -63,6 +81,17 @@ def train(
                 proxy_extractor=proxy_extractor,
                 proxy_loss_fn=proxy_loss_fn,
             )
+            total_steps += 1
+
+            loss_entry = {
+                "epoch": epoch + 1,
+                "step": total_steps,
+                "rate_loss": float(losses["rate_loss"]),
+                "mse_loss": float(losses["mse_loss"]),
+                "task_loss": float(losses["task_loss"]),
+                "total_loss": float(losses["total_loss"]),
+            }
+            loss_history.append(loss_entry)
 
             print(
                 f"Epoch {epoch + 1}/{epochs} "
@@ -72,6 +101,25 @@ def train(
                 f"Task={losses['task_loss'].item():.4f} "
                 f"Total={losses['total_loss'].item():.4f}"
             )
+
+        if checkpoint_dir is not None and (epoch + 1) % checkpoint_interval == 0:
+            ckpt_path = Path(checkpoint_dir) / f"lic_epoch_{epoch + 1}.pt"
+            save_checkpoint(
+                filepath=ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                step=total_steps,
+                loss_history=loss_history,
+                config={
+                    "dataset_root": str(dataset_root),
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "learning_rate": learning_rate,
+                    "use_proxy_loss": use_proxy_loss,
+                },
+            )
+            print(f"Checkpoint saved: {ckpt_path}")
 
     return model
 
