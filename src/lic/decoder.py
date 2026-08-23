@@ -60,6 +60,7 @@ class LICDecoder(nn.Module):
                 padding=2,
                 output_padding=1,
             ),
+            nn.Sigmoid(),
         )
 
     def forward(self, y):
