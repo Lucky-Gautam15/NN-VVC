@@ -24,20 +24,30 @@ def train(
     checkpoint_interval=1,
     resume_from=None,
     use_lws=True,
+    crop_size=256,
+    num_workers=0,
+    device=None,
+    seed=None,
 ):
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     dataset = OpenImagesDataset(
         dataset_root,
-        crop_size=256,
+        crop_size=crop_size,
     )
 
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=num_workers,
     )
 
-    model = LICModel()
+    model = LICModel().to(device)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -52,23 +62,23 @@ def train(
 
     if resume_from is not None:
         print(f"Resuming from checkpoint: {resume_from}")
-        ckpt = load_checkpoint(resume_from, model=model, optimizer=optimizer)
+        ckpt = load_checkpoint(resume_from, model=model, optimizer=optimizer, map_location=device)
         start_epoch = ckpt.get("epoch", 0)
         total_steps = ckpt.get("step", 0)
         loss_history = ckpt.get("loss_history", [])
         print(f"Resumed at Epoch: {start_epoch}, Step: {total_steps}")
 
-    rate_loss_fn = GaussianRateLoss()
-    mse_loss_fn = MSELoss()
+    rate_loss_fn = GaussianRateLoss().to(device)
+    mse_loss_fn = MSELoss().to(device)
     lic_loss_fn = LICLoss(
         w_rate=1.0,
         w_mse=1.0,
         w_task=1.0,
-    )
+    ).to(device)
 
     if use_proxy_loss:
-        proxy_extractor = ProxyFeatureExtractor()
-        proxy_loss_fn = ProxyFeatureLoss()
+        proxy_extractor = ProxyFeatureExtractor().to(device)
+        proxy_loss_fn = ProxyFeatureLoss().to(device)
     else:
         proxy_extractor = None
         proxy_loss_fn = None
@@ -96,6 +106,7 @@ def train(
                 lic_loss_fn,
                 proxy_extractor=proxy_extractor,
                 proxy_loss_fn=proxy_loss_fn,
+                device=device,
             )
             total_steps += 1
 

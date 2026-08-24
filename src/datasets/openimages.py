@@ -52,6 +52,7 @@ class OpenImagesDataset(Dataset):
             self.transform = transform
         elif crop_size is not None:
             self.transform = transforms.Compose([
+                transforms.Resize(crop_size),
                 transforms.RandomCrop(crop_size),
                 transforms.ToTensor(),
             ])

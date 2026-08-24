@@ -10,6 +10,7 @@ def train_step(
     lic_loss_fn,
     proxy_extractor=None,
     proxy_loss_fn=None,
+    device=None,
 ):
     """
     Run one training step for the prototype LIC model.
@@ -24,6 +25,9 @@ def train_step(
           -> backward
           -> optimizer step
     """
+
+    if device is not None:
+        x = x.to(device)
 
     model.train()
 
