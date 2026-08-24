@@ -1,0 +1,14 @@
+training:
+  dataset_root: data/processed/openimages
+  crop_size: 256
+  batch_size: 1
+  num_workers: 0
+  learning_rate: 0.0002
+  optimizer: adam
+  seed: 42
+  device: auto
+  checkpoint_dir: checkpoints/lic
+  checkpoint_interval: 1
+  epochs: 320
+  use_proxy_loss: true
+  use_lws: true
