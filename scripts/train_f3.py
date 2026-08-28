@@ -74,8 +74,8 @@ def _build_lic_parser(subparsers):
     # Training hyper-parameters
     p.add_argument("--epochs", type=int, default=320,
                    help="Total training epochs [default: 320]")
-    p.add_argument("--batch-size", type=int, default=8,
-                   help="Images per batch [default: 8]")
+    p.add_argument("--batch-size", type=int, default=4,
+                   help="Images per batch [default: 4]")
     p.add_argument("--lr", type=float, default=2e-4,
                    help="Adam learning rate [default: 2e-4]")
     p.add_argument("--seed", type=int, default=42,

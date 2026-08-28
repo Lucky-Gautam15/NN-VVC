@@ -86,6 +86,7 @@ def train_step(
                 target_features = proxy_extractor(x)
             reconstructed_features = proxy_extractor(output["reconstruction"])
             task_loss = proxy_loss_fn(target_features, reconstructed_features)
+            del target_features, reconstructed_features
         else:
             task_loss = torch.zeros_like(mse_loss)
 

@@ -375,6 +375,9 @@ def train(
             w_task=w_task,
         )
 
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
     logger.info("Training complete.")
     logger.close()
     return model
