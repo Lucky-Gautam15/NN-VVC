@@ -45,12 +45,25 @@ def save_checkpoint(
     }
     checkpoint.update(kwargs)
 
-    # Safe atomic save: write to temporary file first, then replace target.
-    temp_path = filepath.with_name(f"{filepath.name}.tmp")
-    torch.save(checkpoint, temp_path)
-    temp_path.replace(filepath)
+    # Atomic save strategy:
+    #   1. Try writing to a .tmp sibling, then rename (preferred — protects against crash).
+    #   2. If torch.save fails on the .tmp (Windows ZIP-writer bug on some temp paths),
+    #      fall back to writing directly to the target path.
+    temp_path = filepath.with_suffix(filepath.suffix + ".tmp")
+    try:
+        torch.save(checkpoint, temp_path)
+        temp_path.replace(filepath)
+    except (RuntimeError, OSError):
+        # Clean up any partial temp file
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        # Direct write fallback (non-atomic but correct)
+        torch.save(checkpoint, filepath)
 
     return filepath
+
 
 
 def load_checkpoint(
