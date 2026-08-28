@@ -563,6 +563,31 @@ class TestCLIArgParsing(unittest.TestCase):
         ])
         self.assertTrue(args.no_amp)
 
+    def test_cli_invocation_outside_repo_root(self):
+        """Verify train_f3.py imports src correctly even when invoked from an external cwd."""
+        import subprocess
+        script_path = Path(__file__).resolve().parent.parent / "scripts" / "train_f3.py"
+        with tempfile.TemporaryDirectory() as external_cwd:
+            # 1. Test top-level --help
+            res_help = subprocess.run(
+                [sys.executable, str(script_path), "--help"],
+                cwd=external_cwd,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_help.returncode, 0, f"--help failed: {res_help.stderr}")
+            self.assertIn("train_f3.py", res_help.stdout)
+
+            # 2. Test lic subcommand help
+            res_lic = subprocess.run(
+                [sys.executable, str(script_path), "lic", "--help"],
+                cwd=external_cwd,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_lic.returncode, 0, f"lic --help failed: {res_lic.stderr}")
+            self.assertIn("--data-dir", res_lic.stdout)
+
 
 # -------------------------------------------------------------------------- #
 # Test: Package script (import and basic logic)
