@@ -5,7 +5,7 @@ Public API is backward-compatible: callers that omit the new kwargs
 (max_grad_norm, scaler) behave identically to the original implementation.
 """
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -20,9 +20,9 @@ def train_step(
     lic_loss_fn: nn.Module,
     proxy_extractor: Optional[nn.Module] = None,
     proxy_loss_fn: Optional[nn.Module] = None,
-    device: Optional[str] = None,
+    device: Optional[Union[str, torch.device]] = None,
     max_grad_norm: Optional[float] = None,
-    scaler: Optional["torch.cuda.amp.GradScaler"] = None,
+    scaler: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Run one training step for the LIC model.
@@ -48,7 +48,7 @@ def train_step(
         lic_loss_fn: LICLoss (with current LWS weights already set).
         proxy_extractor: Optional frozen ProxyFeatureExtractor.
         proxy_loss_fn: Optional ProxyFeatureLoss.
-        device: Target device string ('cuda' or 'cpu').
+        device: Target device string or torch.device ('cuda' or 'cpu').
         max_grad_norm: If set, clip gradient L2-norm to this value before the
             optimizer step. Typically 1.0.
         scaler: If set, use AMP GradScaler for mixed-precision training.
@@ -66,9 +66,8 @@ def train_step(
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    use_amp = scaler is not None
-    # torch.amp.autocast is preferred in PyTorch >= 2.0 (torch.cuda.amp.autocast is deprecated)
-    amp_context = torch.amp.autocast("cuda", enabled=use_amp)
+    use_amp = (scaler is not None) and (x.is_cuda if hasattr(x, "is_cuda") else False)
+    amp_context = torch.amp.autocast("cuda", enabled=use_amp) if use_amp else torch.no_grad() if False else nullcontext_wrapper()
 
     with amp_context:
         output = model(x)
@@ -93,7 +92,7 @@ def train_step(
         total_loss = lic_loss_fn(rate_loss, mse_loss, task_loss)
 
     # Backward pass
-    if use_amp:
+    if use_amp and scaler is not None:
         scaler.scale(total_loss).backward()
     else:
         total_loss.backward()
@@ -104,7 +103,7 @@ def train_step(
     clipped = False
 
     if max_grad_norm is not None:
-        if use_amp:
+        if use_amp and scaler is not None:
             scaler.unscale_(optimizer)
         grad_norm_val = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_norm=max_grad_norm
@@ -119,7 +118,7 @@ def train_step(
         grad_norm = grad_norm_val.detach()
 
     # Optimizer step
-    if use_amp:
+    if use_amp and scaler is not None:
         scaler.step(optimizer)
         scaler.update()
     else:
@@ -133,3 +132,11 @@ def train_step(
         "grad_norm": grad_norm,
         "clipped": clipped,
     }
+
+
+class nullcontext_wrapper:
+    """Lightweight context manager for non-AMP execution."""
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        pass

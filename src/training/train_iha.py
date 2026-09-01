@@ -11,49 +11,61 @@ Prerequisites:
   - A trained LIC model checkpoint must exist at `lic_checkpoint_path`.
   - The LIC model is used in inference-only mode (no gradient) to produce
     the reconstructed images that the IHA is trained to adapt.
-
-IMPORTANT:
-  - The IHA is trained AFTER LIC training completes.
-  - Do not train IHA before a verified LIC checkpoint exists.
-  - Do not call this function automatically; it requires explicit invocation
-    with a real LIC checkpoint.
 """
 
-import time
 import math
+import random
+import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
-import random
 
 from src.adapters.iha import IntraHumanAdapter
+from src.datasets.openimages import OpenImagesDataset
 from src.lic.lic_model import LICModel
 from src.losses.mse_loss import MSELoss
-from src.training.checkpoint import save_checkpoint, load_checkpoint
-from src.training.seed_utils import seed_everything, worker_init_fn
+from src.training.checkpoint import load_checkpoint, save_checkpoint
 from src.training.logger import TrainingLogger
-from src.datasets.openimages import OpenImagesDataset
-
+from src.training.seed_utils import seed_everything, worker_init_fn
 
 # QP values for IHA training (matches LIC target QPs)
 IHA_TARGET_QPS: List[int] = [22, 27, 32, 37, 42, 47]
+
+
+def _resolve_device(device: Optional[Union[str, torch.device]] = None) -> str:
+    """Resolve target device string and validate CUDA availability."""
+    if device is None or device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    device_str = str(device).lower()
+    if device_str.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device was explicitly requested ('{device}'), but torch.cuda.is_available() is False."
+            )
+        return device_str
+    elif device_str == "cpu":
+        return "cpu"
+    else:
+        return device_str
+
+
+def _create_grad_scaler(use_amp: bool):
+    """Create mixed-precision GradScaler compatible with PyTorch 2.x and earlier."""
+    if not use_amp:
+        return None
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except (TypeError, AttributeError):
+        return torch.cuda.amp.GradScaler(enabled=True)
 
 
 @torch.no_grad()
 def _get_lic_reconstruction(lic_model: nn.Module, x: torch.Tensor, device: str) -> torch.Tensor:
     """
     Run the LIC model in inference mode to produce a reconstructed image.
-
-    Args:
-        lic_model: Trained, frozen LIC model.
-        x: Original images [B, 3, H, W].
-        device: Target device.
-
-    Returns:
-        Reconstructed images [B, 3, H, W] in [0, 1].
     """
     x = x.to(device)
     lic_model.eval()
@@ -72,7 +84,7 @@ def train_iha(
     checkpoint_interval: int = 5,
     resume_from: Optional[str] = None,
     crop_size: int = 256,
-    num_workers: int = 0,
+    num_workers: int = 2,
     device: Optional[str] = None,
     seed: Optional[int] = None,
     val_dataset_root: Optional[str] = None,
@@ -86,41 +98,6 @@ def train_iha(
 ) -> IntraHumanAdapter:
     """
     Train the Intra Human Adapter (IHA) for a specific QP.
-
-    The IHA is trained with pure MSE loss, receiving LIC-reconstructed images
-    as input and targeting the original images. This requires a trained LIC
-    checkpoint — training IHA from scratch without a verified LIC checkpoint
-    is not valid.
-
-    Args:
-        dataset_root: Path to training images.
-        lic_checkpoint_path: Path to a trained LIC model checkpoint.
-        qp: QP value for this IHA training run (22, 27, 32, 37, 42, or 47).
-        epochs: Training epochs.
-        batch_size: Images per batch.
-        learning_rate: Adam initial LR.
-        checkpoint_dir: Directory to save IHA checkpoints.
-        checkpoint_interval: Save every N epochs.
-        resume_from: Path to existing IHA checkpoint to resume.
-        crop_size: Random crop size.
-        num_workers: DataLoader workers.
-        device: 'cuda', 'cpu', or None (auto-detect).
-        seed: RNG seed.
-        val_dataset_root: Optional validation set path.
-        val_frequency: Validate every N epochs.
-        use_amp: Enable AMP. None = auto (True on CUDA).
-        log_dir: Log output directory.
-        run_name: Run identifier for log filenames.
-        smoke: Enable smoke-test mode (tiny subset, fast).
-        smoke_samples: Number of samples in smoke mode.
-        force_deterministic: Enable cudnn deterministic mode.
-
-    Returns:
-        Trained IntraHumanAdapter model.
-
-    Raises:
-        FileNotFoundError: If lic_checkpoint_path does not exist.
-        ValueError: If qp is not one of the valid target QPs.
     """
     if qp not in IHA_TARGET_QPS:
         raise ValueError(
@@ -137,26 +114,26 @@ def train_iha(
         )
 
     # ------------------------------------------------------------------ #
-    # Seed
+    # 1. Seed
     # ------------------------------------------------------------------ #
     if seed is not None:
         seed_everything(seed, force_deterministic=force_deterministic)
 
     # ------------------------------------------------------------------ #
-    # Device & AMP
+    # 2. Device & AMP
     # ------------------------------------------------------------------ #
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _resolve_device(device)
+    is_cuda = device.startswith("cuda")
 
     if use_amp is None:
-        use_amp = (device == "cuda")
-    if use_amp and device != "cuda":
+        use_amp = is_cuda
+    if use_amp and not is_cuda:
         use_amp = False
 
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = _create_grad_scaler(use_amp)
 
     # ------------------------------------------------------------------ #
-    # Logger
+    # 3. Logger & System Diagnostics
     # ------------------------------------------------------------------ #
     if log_dir is None:
         log_dir = str(Path(checkpoint_dir).parent / "logs")
@@ -174,7 +151,7 @@ def train_iha(
         )
 
     # ------------------------------------------------------------------ #
-    # Load frozen LIC model
+    # 4. Load frozen LIC model
     # ------------------------------------------------------------------ #
     logger.info(f"Loading LIC model from: {lic_ckpt}")
     lic_model = LICModel().to(device)
@@ -185,9 +162,9 @@ def train_iha(
     logger.info("LIC model loaded and frozen.")
 
     # ------------------------------------------------------------------ #
-    # Datasets
+    # 5. Datasets
     # ------------------------------------------------------------------ #
-    pin_mem = (device == "cuda")
+    pin_mem = is_cuda
     persist_workers = (num_workers > 0)
 
     train_dataset = OpenImagesDataset(dataset_root, crop_size=crop_size)
@@ -224,17 +201,16 @@ def train_iha(
         )
 
     # ------------------------------------------------------------------ #
-    # IHA model, optimizer, loss
+    # 6. IHA model, optimizer, loss
     # ------------------------------------------------------------------ #
     iha = IntraHumanAdapter().to(device)
     optimizer = torch.optim.Adam(iha.parameters(), lr=learning_rate)
     mse_loss_fn = MSELoss().to(device)
 
-    # QP tensor (broadcast to batch on the fly in forward loop)
     qp_val = float(qp)
 
     # ------------------------------------------------------------------ #
-    # Resume
+    # 7. Resume
     # ------------------------------------------------------------------ #
     start_epoch = 0
     total_steps = 0
@@ -242,7 +218,7 @@ def train_iha(
 
     if resume_from is not None:
         logger.info(f"Resuming IHA from: {resume_from}")
-        ckpt = load_checkpoint(resume_from, model=iha, optimizer=optimizer, map_location=device)
+        ckpt = load_checkpoint(resume_from, model=iha, optimizer=optimizer, map_location=device, restore_rng=True)
         start_epoch = ckpt.get("epoch", 0)
         total_steps = ckpt.get("step", 0)
         loss_history = ckpt.get("loss_history", [])
@@ -251,7 +227,7 @@ def train_iha(
         logger.info(f"Resumed at epoch={start_epoch}, step={total_steps}")
 
     # ------------------------------------------------------------------ #
-    # Training loop
+    # 8. Training loop
     # ------------------------------------------------------------------ #
     run_start = time.time()
 
@@ -273,12 +249,12 @@ def train_iha(
 
             optimizer.zero_grad(set_to_none=True)
 
-            amp_ctx = torch.amp.autocast("cuda", enabled=use_amp)
+            amp_ctx = torch.amp.autocast("cuda", enabled=use_amp) if use_amp else nullcontext_wrapper()
             with amp_ctx:
                 x_adapted = iha(x_lic, qp=qp_tensor)
                 loss = mse_loss_fn(x_orig, x_adapted)
 
-            if use_amp:
+            if use_amp and scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(iha.parameters(), max_norm=1.0)
@@ -346,6 +322,7 @@ def train_iha(
                 train_loss=avg_train_loss,
                 val_loss=avg_val_loss,
                 scaler_state_dict=scaler.state_dict() if scaler is not None else None,
+                save_rng=True,
             )
 
         logger.log_epoch(
@@ -363,6 +340,17 @@ def train_iha(
             qp=qp,
         )
 
+        if is_cuda:
+            torch.cuda.empty_cache()
+
     logger.info(f"IHA training complete for QP={qp}.")
     logger.close()
     return iha
+
+
+class nullcontext_wrapper:
+    """Lightweight context manager for non-AMP execution."""
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        pass

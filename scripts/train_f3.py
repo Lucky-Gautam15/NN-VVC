@@ -9,32 +9,33 @@ Usage examples
 --------------
 
 CPU smoke test (LIC, no proxy loss):
-    python scripts/train_f3.py lic \\
-        --data-dir data/processed/openimages/train \\
-        --val-dir  data/processed/openimages/val \\
+    python scripts/train_f3.py lic \
+        --data-dir data/processed/openimages/train \
+        --val-dir  data/processed/openimages/val \
         --smoke --no-proxy
 
-GPU full LIC training (Colab):
-    python scripts/train_f3.py lic \\
-        --data-dir /content/data/train \\
-        --val-dir  /content/data/val \\
-        --checkpoint-dir /content/drive/MyDrive/NN_VVC/checkpoints/lic \\
-        --log-dir  /content/drive/MyDrive/NN_VVC/logs \\
-        --epochs 320 --batch-size 16 --use-amp --seed 42
+GPU full LIC training (Colab / Tesla T4):
+    python scripts/train_f3.py lic \
+        --data-dir /content/data/openimages/train \
+        --val-dir  /content/data/openimages/val \
+        --checkpoint-dir /content/drive/MyDrive/NN_VVC/checkpoints/lic \
+        --log-dir  /content/drive/MyDrive/NN_VVC/logs \
+        --epochs 50 --batch-size 4 --num-workers 2 --device cuda --use-amp --seed 42
 
-Resume LIC training from latest checkpoint:
-    python scripts/train_f3.py lic \\
-        --data-dir /content/data/train \\
-        --checkpoint-dir /content/drive/MyDrive/NN_VVC/checkpoints/lic \\
-        --resume-from /content/drive/MyDrive/NN_VVC/checkpoints/lic/lic_epoch_68.pt \\
-        --epochs 320
+Resume LIC training from checkpoint:
+    python scripts/train_f3.py lic \
+        --data-dir /content/data/openimages/train \
+        --val-dir  /content/data/openimages/val \
+        --checkpoint-dir /content/drive/MyDrive/NN_VVC/checkpoints/lic \
+        --resume-from /content/drive/MyDrive/NN_VVC/checkpoints/lic/lic_epoch_20.pt \
+        --epochs 50 --batch-size 4 --device cuda
 
 IHA training for QP=32 (requires a trained LIC checkpoint):
-    python scripts/train_f3.py iha \\
-        --data-dir data/processed/openimages/train \\
-        --val-dir  data/processed/openimages/val \\
-        --lic-checkpoint checkpoints/lic/lic_qp32_epoch170.pt \\
-        --qp 32 --epochs 50 --batch-size 8 --seed 42
+    python scripts/train_f3.py iha \
+        --data-dir /content/data/openimages/train \
+        --val-dir  /content/data/openimages/val \
+        --lic-checkpoint checkpoints/lic/lic_qp32_epoch170.pt \
+        --qp 32 --epochs 50 --batch-size 4 --seed 42
 """
 
 import argparse
@@ -45,6 +46,51 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+import torch
+import torchvision
+
+
+def _print_system_banner(args, mode: str):
+    """Print comprehensive system, GPU, and training diagnostics banner."""
+    cuda_avail = torch.cuda.is_available()
+    device_req = getattr(args, "device", "auto") or "auto"
+
+    print("\n" + "=" * 65)
+    print(f"NN-VVC Phase F-3 Training Pipeline — Mode: {mode.upper()}")
+    print("=" * 65)
+    print(f"  PyTorch Version      : {torch.__version__}")
+    print(f"  Torchvision Version  : {torchvision.__version__}")
+    print(f"  CUDA Available       : {cuda_avail}")
+    print(f"  CUDA Version (torch) : {torch.version.cuda if cuda_avail else 'N/A'}")
+    print(f"  Requested Device     : {device_req}")
+
+    if cuda_avail:
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_props = torch.cuda.get_device_properties(0)
+        total_mem_gb = gpu_props.total_memory / (1024 ** 3)
+        print(f"  GPU Name             : {gpu_name}")
+        print(f"  GPU Total Memory     : {total_mem_gb:.2f} GB")
+        print(f"  GPU Multi-Processor  : {gpu_props.multi_processor_count} SMs")
+    else:
+        print("  GPU Info             : None detected / CPU Mode")
+
+    use_amp = _resolve_amp(args)
+    print(f"  AMP Mixed Precision  : {'Enabled' if use_amp else 'Disabled'}")
+    print(f"  Batch Size           : {args.batch_size}")
+    print(f"  Data Workers         : {args.num_workers}")
+    print(f"  Random Seed          : {args.seed}")
+    print(f"  Target Epochs        : {args.epochs}")
+    print(f"  Data Directory       : {args.data_dir}")
+    print(f"  Val Directory        : {args.val_dir}")
+    print(f"  Checkpoint Directory : {args.checkpoint_dir}")
+    if mode == "lic":
+        print(f"  Proxy Loss (MaskRCNN): {not getattr(args, 'no_proxy', False)}")
+        print(f"  LWS Scheduler        : {not getattr(args, 'no_lws', False)}")
+    elif mode == "iha":
+        print(f"  Target QP            : {args.qp}")
+        print(f"  LIC Checkpoint       : {args.lic_checkpoint}")
+    print("=" * 65 + "\n")
 
 
 def _build_lic_parser(subparsers):
@@ -73,23 +119,23 @@ def _build_lic_parser(subparsers):
 
     # Training hyper-parameters
     p.add_argument("--epochs", type=int, default=320,
-                   help="Total training epochs [default: 320]")
+                   help="Total training epochs [default: 320, recommended test: 50]")
     p.add_argument("--batch-size", type=int, default=4,
-                   help="Images per batch [default: 4]")
+                   help="Images per batch (safe default for Tesla T4: 4) [default: 4]")
     p.add_argument("--lr", type=float, default=2e-4,
                    help="Adam learning rate [default: 2e-4]")
     p.add_argument("--seed", type=int, default=42,
                    help="RNG seed [default: 42]")
     p.add_argument("--num-workers", type=int, default=2,
-                   help="DataLoader worker processes [default: 2]")
+                   help="DataLoader worker processes (safe Colab default: 2) [default: 2]")
     p.add_argument("--crop-size", type=int, default=256,
                    help="Random crop size [default: 256]")
     p.add_argument("--max-grad-norm", type=float, default=1.0,
                    help="Gradient clipping max L2 norm [default: 1.0]")
 
     # Device / precision
-    p.add_argument("--device", default=None,
-                   help="'cuda', 'cpu', or unset (auto-detect)")
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                   help="'auto', 'cuda', or 'cpu' [default: auto]")
     p.add_argument("--use-amp", action="store_true", default=None,
                    help="Enable AMP mixed-precision (CUDA only)")
     p.add_argument("--no-amp", action="store_true",
@@ -97,7 +143,7 @@ def _build_lic_parser(subparsers):
 
     # Model options
     p.add_argument("--no-proxy", action="store_true",
-                   help="Disable proxy/task loss (faster, no 170MB download)")
+                   help="Disable proxy/task loss (for lightweight testing only)")
     p.add_argument("--no-lws", action="store_true",
                    help="Disable Loss Weighting Strategy scheduler")
     p.add_argument("--force-deterministic", action="store_true",
@@ -105,8 +151,7 @@ def _build_lic_parser(subparsers):
 
     # Smoke test
     p.add_argument("--smoke", action="store_true",
-                   help="Smoke-test mode: 3 epochs, tiny subset, marks "
-                        "checkpoint as non-research")
+                   help="Smoke-test mode: tiny subset, marks checkpoint as non-research")
     p.add_argument("--smoke-epochs", type=int, default=3,
                    help="Epochs in smoke mode [default: 3]")
     p.add_argument("--smoke-samples", type=int, default=64,
@@ -149,7 +194,7 @@ def _build_iha_parser(subparsers):
     p.add_argument("--epochs", type=int, default=50,
                    help="Training epochs [default: 50]")
     p.add_argument("--batch-size", type=int, default=4,
-                   help="Images per batch [default: 4]")
+                   help="Images per batch (safe default: 4) [default: 4]")
     p.add_argument("--lr", type=float, default=1e-4,
                    help="Adam learning rate [default: 1e-4]")
     p.add_argument("--seed", type=int, default=42,
@@ -160,8 +205,8 @@ def _build_iha_parser(subparsers):
                    help="Random crop size [default: 256]")
 
     # Device / precision
-    p.add_argument("--device", default=None,
-                   help="'cuda', 'cpu', or unset (auto-detect)")
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                   help="'auto', 'cuda', or 'cpu' [default: auto]")
     p.add_argument("--use-amp", action="store_true", default=None)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--force-deterministic", action="store_true")
@@ -177,13 +222,12 @@ def _build_iha_parser(subparsers):
 
 def _resolve_amp(args) -> bool:
     """Resolve --use-amp / --no-amp flags."""
-    import torch
     if getattr(args, "no_amp", False):
         return False
-    if getattr(args, "use_amp", None):
+    if getattr(args, "use_amp", None) is True:
         return True
     # auto: enable on CUDA
-    return torch.cuda.is_available()
+    return torch.cuda.is_available() and getattr(args, "device", "auto") != "cpu"
 
 
 def run_lic(args):
@@ -192,18 +236,7 @@ def run_lic(args):
     use_amp = _resolve_amp(args)
     epochs = args.smoke_epochs if args.smoke else args.epochs
 
-    print(f"\n{'='*60}")
-    print("NN-VVC F-3 — LIC Training")
-    print(f"{'='*60}")
-    print(f"  data_dir      : {args.data_dir}")
-    print(f"  val_dir       : {args.val_dir}")
-    print(f"  checkpoint_dir: {args.checkpoint_dir}")
-    print(f"  epochs        : {epochs}")
-    print(f"  batch_size    : {args.batch_size}")
-    print(f"  use_amp       : {use_amp}")
-    print(f"  proxy_loss    : {not args.no_proxy}")
-    print(f"  smoke         : {args.smoke}")
-    print(f"{'='*60}\n")
+    _print_system_banner(args, mode="lic")
 
     if args.smoke:
         print(
@@ -235,7 +268,7 @@ def run_lic(args):
         smoke_samples=args.smoke_samples,
         force_deterministic=args.force_deterministic,
     )
-    print("\nLIC training finished.")
+    print("\nLIC training finished successfully.")
     return model
 
 
@@ -245,19 +278,7 @@ def run_iha(args):
     use_amp = _resolve_amp(args)
     epochs = args.smoke_epochs if args.smoke else args.epochs
 
-    print(f"\n{'='*60}")
-    print(f"NN-VVC F-3 — IHA Training (QP={args.qp})")
-    print(f"{'='*60}")
-    print(f"  data_dir       : {args.data_dir}")
-    print(f"  val_dir        : {args.val_dir}")
-    print(f"  lic_checkpoint : {args.lic_checkpoint}")
-    print(f"  qp             : {args.qp}")
-    print(f"  checkpoint_dir : {args.checkpoint_dir}")
-    print(f"  epochs         : {epochs}")
-    print(f"  batch_size     : {args.batch_size}")
-    print(f"  use_amp        : {use_amp}")
-    print(f"  smoke          : {args.smoke}")
-    print(f"{'='*60}\n")
+    _print_system_banner(args, mode="iha")
 
     iha = train_iha(
         dataset_root=args.data_dir,
@@ -282,14 +303,14 @@ def run_iha(args):
         smoke_samples=args.smoke_samples,
         force_deterministic=args.force_deterministic,
     )
-    print("\nIHA training finished.")
+    print("\nIHA training finished successfully.")
     return iha
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="train_f3.py",
-        description="NN-VVC Phase F-3 — LIC and IHA training CLI",
+        description="NN-VVC Phase F-3 — LIC and IHA GPU Training CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

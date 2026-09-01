@@ -93,11 +93,14 @@ def cmd_pack(args):
     #   entry["valid"]           bool — skip invalid entries
     # Arc key inside ZIP = last two path components: "train/<name>.png"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest_entries = {
-        "/".join(Path(entry["processed_path"]).parts[-2:]): entry["sha256"]
-        for entry in manifest.get("images", [])
-        if entry.get("valid", True)
-    }
+    manifest_entries = {}
+    for entry in manifest.get("images", []):
+        if not entry.get("valid", True):
+            continue
+        p = entry.get("processed_path") or entry.get("filename")
+        if p:
+            arc_key = "/".join(Path(p).parts[-2:])
+            manifest_entries[arc_key] = entry.get("sha256")
     print(f"Manifest: {len(manifest_entries)} entries")
 
     # Collect files
@@ -177,12 +180,14 @@ def cmd_verify(args):
         sys.exit(1)
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    # Same field mapping as cmd_pack: arc key = last 2 parts of processed_path
-    manifest_entries = {
-        "/".join(Path(entry["processed_path"]).parts[-2:]): entry["sha256"]
-        for entry in manifest.get("images", [])
-        if entry.get("valid", True)
-    }
+    manifest_entries = {}
+    for entry in manifest.get("images", []):
+        if not entry.get("valid", True):
+            continue
+        p = entry.get("processed_path") or entry.get("filename")
+        if p:
+            arc_key = "/".join(Path(p).parts[-2:])
+            manifest_entries[arc_key] = entry.get("sha256")
 
     print(f"Verifying archive: {archive_path}")
     errors = []

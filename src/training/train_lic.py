@@ -1,47 +1,80 @@
 """
 LIC training loop for NN-VVC Phase F-3.
 
-Improvements over the prototype:
-  - Validation loop (val_step) after each epoch
-  - AMP / GradScaler support (CUDA only, auto-disabled on CPU)
+Optimized for reliable CUDA GPU execution (Tesla T4 / Colab):
+  - Robust device detection with explicit CUDA failure reporting
+  - Modernized AMP / GradScaler support (PyTorch 2.x API with fallback)
+  - Memory-safe proxy loss evaluation with immediate intermediate tensor cleanup
   - Gradient clipping via train_step (max_grad_norm)
-  - Deterministic seeding via seed_utils.seed_everything
+  - Deterministic seeding and full RNG state preservation
   - Persistent per-epoch JSONL + CSV logging via TrainingLogger
   - pin_memory + persistent_workers when num_workers > 0 on GPU
-  - Atomic checkpoint save (inherited from checkpoint.py)
-  - Full scaler state in checkpoints for safe AMP resume
-  - Smoke-test mode: tiny subset, 3 epochs, no proxy
-
-All existing parameters are backward-compatible: callers that use the
-original positional/keyword arguments continue to work unchanged.
+  - Atomic checkpoint save with RNG and scaler state restoration
+  - Safe default batch size of 4 with explicit epoch resumption indexing
 """
 
+import random
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch.utils.data import DataLoader, Subset
-import random
 
 from src.datasets.openimages import OpenImagesDataset
 from src.lic.lic_model import LICModel
-from src.losses.rate_loss import GaussianRateLoss
+from src.losses.lic_loss import LICLoss
 from src.losses.mse_loss import MSELoss
 from src.losses.proxy_loss import ProxyFeatureExtractor, ProxyFeatureLoss
-from src.losses.lic_loss import LICLoss
-from src.training.train_step import train_step
-from src.training.val_step import val_step
-from src.training.checkpoint import save_checkpoint, load_checkpoint
+from src.losses.rate_loss import GaussianRateLoss
+from src.training.checkpoint import load_checkpoint, save_checkpoint
+from src.training.logger import TrainingLogger
 from src.training.lws import LWSScheduler
 from src.training.seed_utils import seed_everything, worker_init_fn
-from src.training.logger import TrainingLogger
+from src.training.train_step import train_step
+from src.training.val_step import val_step
+
+
+def _resolve_device(device: Optional[Union[str, torch.device]] = None) -> str:
+    """
+    Resolve target device string and validate CUDA availability.
+    """
+    if device is None or device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    
+    device_str = str(device).lower()
+    if device_str.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device was explicitly requested ('{device}'), but torch.cuda.is_available() is False. "
+                "Ensure NVIDIA drivers and a CUDA-compatible PyTorch build are installed, "
+                "or pass '--device cpu' or '--device auto'."
+            )
+        return device_str
+    elif device_str == "cpu":
+        return "cpu"
+    else:
+        return device_str
+
+
+def _create_grad_scaler(use_amp: bool):
+    """
+    Create a mixed-precision GradScaler compatible with PyTorch 2.x and earlier.
+    """
+    if not use_amp:
+        return None
+    try:
+        # Modern PyTorch 2.0+ API
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except (TypeError, AttributeError):
+        # Legacy PyTorch fallback
+        return torch.cuda.amp.GradScaler(enabled=True)
 
 
 def train(
     dataset_root,
     epochs=1,
-    batch_size=1,
+    batch_size=4,
     learning_rate=2e-4,
     use_proxy_loss=True,
     checkpoint_dir="checkpoints/lic",
@@ -49,10 +82,9 @@ def train(
     resume_from=None,
     use_lws=True,
     crop_size=256,
-    num_workers=0,
+    num_workers=2,
     device=None,
     seed=None,
-    # F-3 additions (all optional, backward-compatible defaults)
     val_dataset_root=None,
     val_frequency=1,
     max_grad_norm: Optional[float] = 1.0,
@@ -68,30 +100,27 @@ def train(
 
     Args:
         dataset_root: Path to training image directory.
-        epochs: Total training epochs (full schedule = 320).
-        batch_size: Images per batch.
+        epochs: Total training epochs (full schedule = 320, standard test = 50).
+        batch_size: Images per batch (default safe size: 4).
         learning_rate: Adam initial LR.
-        use_proxy_loss: Enable proxy/task loss.
+        use_proxy_loss: Enable proxy/task loss (Mask R-CNN FPN).
         checkpoint_dir: Directory to save checkpoints.
         checkpoint_interval: Save checkpoint every N epochs.
         resume_from: Path to checkpoint to resume from.
         use_lws: Enable Loss Weighting Strategy scheduler.
         crop_size: Random crop size for training images.
-        num_workers: DataLoader worker processes.
-        device: 'cuda', 'cpu', or None (auto-detect).
-        seed: RNG seed for reproducibility.
-        val_dataset_root: Path to validation image directory. If None,
-            validation is skipped.
-        val_frequency: Run validation every N epochs (default: every epoch).
-        max_grad_norm: Gradient clipping max L2 norm. None = no clipping.
-        use_amp: Enable AMP (mixed precision). None = auto (True on CUDA).
-        log_dir: Directory to write JSONL/CSV logs. If None, uses
-            checkpoint_dir/../logs.
-        run_name: Unique name for this training run (used in log filenames).
-        smoke: If True, use a tiny random subset for quick end-to-end test.
+        num_workers: DataLoader worker processes (default: 2).
+        device: 'cuda', 'cpu', 'auto', or None (auto-detect).
+        seed: RNG seed for reproducibility (default: 42).
+        val_dataset_root: Path to validation image directory.
+        val_frequency: Run validation every N epochs.
+        max_grad_norm: Gradient clipping max L2 norm.
+        use_amp: Enable AMP. None = auto (True on CUDA).
+        log_dir: Directory to write JSONL/CSV logs.
+        run_name: Unique name for this training run.
+        smoke: If True, use a tiny random subset for fast validation.
         smoke_samples: Number of images for smoke test.
-        force_deterministic: Enable cudnn.deterministic (slower but more
-            reproducible on GPU).
+        force_deterministic: Enable cudnn.deterministic.
 
     Returns:
         Trained LIC model.
@@ -105,32 +134,49 @@ def train(
     # ------------------------------------------------------------------ #
     # 2. Device & AMP
     # ------------------------------------------------------------------ #
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _resolve_device(device)
+    is_cuda = device.startswith("cuda")
 
-    # AMP only makes sense on CUDA
     if use_amp is None:
-        use_amp = (device == "cuda")
-    if use_amp and device != "cuda":
+        use_amp = is_cuda
+    if use_amp and not is_cuda:
         use_amp = False
 
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = _create_grad_scaler(use_amp)
 
     # ------------------------------------------------------------------ #
-    # 3. Logger
+    # 3. Logger & System Diagnostics
     # ------------------------------------------------------------------ #
     if log_dir is None:
         log_dir = str(Path(checkpoint_dir).parent / "logs")
     logger = TrainingLogger(log_dir=log_dir, run_name=run_name)
-    logger.info(
-        f"Device={device} | AMP={use_amp} | epochs={epochs} | "
-        f"batch_size={batch_size} | seed={seed} | smoke={smoke}"
-    )
+
+    logger.info("=" * 60)
+    logger.info("NN-VVC LIC Training Session Initializing")
+    logger.info("=" * 60)
+    logger.info(f"  Device           : {device}")
+    logger.info(f"  CUDA available   : {torch.cuda.is_available()}")
+    if is_cuda and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        logger.info(f"  GPU Name         : {gpu_name}")
+        logger.info(f"  GPU Memory       : {gpu_mem_gb:.2f} GB")
+    logger.info(f"  PyTorch version  : {torch.__version__}")
+    logger.info(f"  AMP Enabled      : {use_amp}")
+    logger.info(f"  Batch Size       : {batch_size}")
+    logger.info(f"  Num Workers      : {num_workers}")
+    logger.info(f"  Target Epochs    : {epochs}")
+    logger.info(f"  Learning Rate    : {learning_rate}")
+    logger.info(f"  Proxy Loss       : {use_proxy_loss}")
+    logger.info(f"  LWS Scheduler    : {use_lws}")
+    logger.info(f"  Seed             : {seed}")
+    logger.info(f"  Smoke Mode       : {smoke}")
+    logger.info("=" * 60)
 
     # ------------------------------------------------------------------ #
     # 4. Datasets & DataLoaders
     # ------------------------------------------------------------------ #
-    pin_mem = (device == "cuda")
+    pin_mem = is_cuda
     persist_workers = (num_workers > 0)
 
     train_dataset = OpenImagesDataset(dataset_root, crop_size=crop_size)
@@ -191,6 +237,7 @@ def train(
     lic_loss_fn = LICLoss(w_rate=1.0, w_mse=1.0, w_task=1.0).to(device)
 
     if use_proxy_loss:
+        logger.info("Initializing Mask R-CNN proxy feature extractor...")
         proxy_extractor = ProxyFeatureExtractor().to(device)
         proxy_loss_fn = ProxyFeatureLoss().to(device)
     else:
@@ -206,11 +253,16 @@ def train(
 
     if resume_from is not None:
         logger.info(f"Resuming from: {resume_from}")
-        ckpt = load_checkpoint(resume_from, model=model, optimizer=optimizer, map_location=device)
+        ckpt = load_checkpoint(
+            resume_from,
+            model=model,
+            optimizer=optimizer,
+            map_location=device,
+            restore_rng=True,
+        )
         start_epoch = ckpt.get("epoch", 0)
         total_steps = ckpt.get("step", 0)
         loss_history = ckpt.get("loss_history", [])
-        # Restore AMP scaler state if present
         if scaler is not None and "scaler_state_dict" in ckpt and ckpt["scaler_state_dict"] is not None:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         logger.info(f"Resumed at epoch={start_epoch}, step={total_steps}")
@@ -235,7 +287,6 @@ def train(
             w_task = lic_loss_fn.w_task
 
         target_qp = lws_scheduler.get_target_qp(current_epoch_num) if lws_scheduler else None
-        qp_tag = f" [QP {target_qp}]" if target_qp else ""
 
         # -- Train epoch --
         epoch_train_losses = []
@@ -353,7 +404,7 @@ def train(
                     w_rate, w_mse, w_task, target_qp,
                     avg_train_loss, avg_val_loss,
                 )
-                logger.info(f"QP checkpoint: {qp_path}")
+                logger.info(f"Target QP Checkpoint reached: {qp_path}")
 
         # -- Log epoch --
         logger.log_epoch(
@@ -375,7 +426,7 @@ def train(
             w_task=w_task,
         )
 
-        if device == "cuda":
+        if is_cuda:
             torch.cuda.empty_cache()
 
     logger.info("Training complete.")
@@ -385,7 +436,7 @@ def train(
 
 def _save(filepath, model, optimizer, scaler, epoch, step, loss_history,
           config, w_rate, w_mse, w_task, target_qp, train_loss, val_loss):
-    """Internal helper: save checkpoint with scaler state."""
+    """Internal helper: save checkpoint with scaler and RNG state."""
     save_checkpoint(
         filepath=filepath,
         model=model,
@@ -399,6 +450,7 @@ def _save(filepath, model, optimizer, scaler, epoch, step, loss_history,
         train_loss=train_loss,
         val_loss=val_loss,
         scaler_state_dict=scaler.state_dict() if scaler is not None else None,
+        save_rng=True,
     )
 
 
